@@ -1,0 +1,718 @@
+package pgproxy
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"log/slog"
+	"math/rand"
+	"slices"
+	"strings"
+	"sync"
+	"time"
+	"unicode/utf8"
+
+	"github.com/jackc/pgx/v5/pgproto3"
+	"github.com/redis/go-redis/v9"
+)
+
+var (
+	// Whether we'll enable `Bind` command caching
+	PGPROXY_ENABLE_CACHE bool
+
+	// Whether we'll check the `Bind` message parameters for a hook (custom behaviour for the proxy)
+	PGPROXY_ENABLE_PARAMETER_HOOK bool
+
+	// Which parameter position we'll check for the hook value. Valid values are `first` or `last`
+	PGPROXY_PARAMETER_HOOK_POSITION string = "first"
+
+	// How long to cache the postgresql command
+	PGPROXY_CACHE_TTL_SECOND int64 = 3600
+
+	// Cache jitter
+	PGPROXY_CACHE_TTL_JITTER_SECOND int64 = 5
+)
+
+type CacheI interface {
+	// Returns list of postgres commands to be sent back to the frontend
+	Get(key string) (*Cache, bool)
+
+	// Saves postgres commands as a cache of the given key
+	Set(key string, val Cache) error
+
+	// Delete `key` as a pattern, will be prepended with `PGPROXY` cache key
+	// so we don't accidentally conflict with other keys
+	DelPattern(key string)
+}
+
+// Buffered postgresql data
+//
+// We buffer the cached data due to the asynchronous nature of the postgres request/response
+// message flow -- a single query request will have a bunch of responses returned by the backend, at least 1 for each
+// records, along with other "metadata" messages
+//
+// The expected running state of this buffer is:
+//
+// 1. On start: any frontend request will be ignored
+// 2. On getting a frontend `Bind` request, we'll start the cache process
+// 3. We'll then listen to all of backend `DataRow` message until a `CommandComplete` is reached
+// 4. The cache buffer is completed & we'll cache the buffered data
+// 5. Go to 1
+//
+// The cache checks itself is done by checking the existing key on step 2, and if found then we'll immediately send
+// `BindComplete`, `DataRow`, and `CommandComplete` messages based on the cached data. The `Bind` frontend request will not
+// be sent to the backend in this case
+type CacheBuffer struct {
+	*sync.Mutex
+	Client CacheI
+
+	// Parameter hook
+	hook hook
+
+	// Buffered postgres commands
+	cached          bool                      // is current request cached
+	bind            *pgproto3.Bind            // frontend
+	describe        *pgproto3.Describe        // frontend
+	execute         *pgproto3.Execute         // frontend
+	rowDescription  *pgproto3.RowDescription  // backend
+	dataRow         []*pgproto3.DataRow       // backend
+	commandComplete *pgproto3.CommandComplete // backend
+	readyForQuery   *pgproto3.ReadyForQuery   // backend
+
+	// Backend cache key
+	key string
+}
+
+func NewCacheBuffer(client CacheI) *CacheBuffer {
+	return &CacheBuffer{Mutex: new(sync.Mutex), Client: client}
+}
+
+// Return value indicate whether the proxy should forward the frontend message to the backend or not
+func (c *CacheBuffer) CacheFrontend(
+	addr string,
+	msg pgproto3.FrontendMessage,
+	frontend *pgproto3.Frontend,
+	backend *pgproto3.Backend,
+	errChan chan<- error,
+) bool {
+	switch msg := msg.(type) {
+	case *pgproto3.Bind:
+		return c.cacheFrontendBind(msg, errChan)
+	case *pgproto3.Describe:
+		c.Mutex.Lock()
+		defer c.Mutex.Unlock()
+		if !c.cached {
+			return true
+		}
+		c.describe = &pgproto3.Describe{
+			ObjectType: msg.ObjectType,
+			Name:       msg.Name,
+		}
+		return false
+	case *pgproto3.Execute:
+		c.Mutex.Lock()
+		defer c.Mutex.Unlock()
+		if !c.cached {
+			return true
+		}
+		c.execute = &pgproto3.Execute{
+			Portal:  msg.Portal,
+			MaxRows: msg.MaxRows,
+		}
+		return false
+	case *pgproto3.Sync:
+		c.Mutex.Lock()
+		if !c.cached {
+			c.Mutex.Unlock()
+			return true
+		}
+		key := key(c.key, c.hook.keySuffix)
+		bind, describe, execute, rowDescription, datarow, command, ready := c.bind, c.describe, c.execute, c.rowDescription, c.dataRow, c.commandComplete, c.readyForQuery
+		c.cached, c.bind, c.describe, c.execute, c.dataRow, c.commandComplete, c.readyForQuery = false, nil, nil, nil, nil, nil, nil
+		c.Mutex.Unlock()
+		if !sendCache(
+			addr,
+			backend,
+			describe,
+			rowDescription,
+			datarow,
+			command,
+			ready,
+			errChan,
+		) {
+			// Cache data issue, we'll release the buffered messages to the backend & let the query run as normal
+			if PGPROXY_VERBOSE {
+				slog.Info("pgproxy_cache_hit_but_invalid", "key", key)
+			}
+			frontend.Send(bind)
+			if err := frontend.Flush(); err != nil {
+				terminate(errChan, errors.Join(errors.New("error when sending message to backend (`Bind` command invalid cache)"), err))
+				return false
+			}
+			if describe != nil {
+				frontend.Send(describe)
+				if err := frontend.Flush(); err != nil {
+					terminate(errChan, errors.Join(errors.New("error when sending message to backend (`Describe` command invalid cache)"), err))
+					return false
+				}
+			}
+			frontend.Send(execute)
+			if err := frontend.Flush(); err != nil {
+				terminate(errChan, errors.Join(errors.New("error when sending message to backend (`Execute` command invalid cache)"), err))
+				return false
+			}
+			return true
+		}
+		return false
+	default:
+		return true
+	}
+}
+
+func (c *CacheBuffer) cacheFrontendBind(msg *pgproto3.Bind, errChan chan<- error) bool {
+	hook := newHook(msg)
+
+	// Invalidating cache key here might be a bit hacky: deleting the key *immediately* before the mutating query
+	// is executed means that another cache might get set which still have the stale data on the database.
+	//
+	// It *might* be okay to just delete it some time after few seconds has passed, if the mutating query is longer
+	// than that then the cached data not getting updated would probably be expected as usual
+	go func(keys []string) {
+		time.Sleep(3 * time.Second)
+		invalidate(c.Client, keys)
+	}(slices.Clone(hook.invalidate))
+
+	if hook.noCache {
+		return true
+	}
+
+	// The whole command is used as the cache key with the exception of the hook parameter, if it is set
+	clearHookParameter(msg)
+	encoded, err := msg.Encode(nil)
+	if err != nil {
+		terminate(errChan, errors.Join(errors.New("invalid frontend message"), err))
+		return false
+	}
+	cachekey, msgcopy := hash(encoded), &pgproto3.Bind{
+		DestinationPortal:    msg.DestinationPortal,
+		PreparedStatement:    msg.PreparedStatement,
+		ParameterFormatCodes: make([]int16, len(msg.ParameterFormatCodes)),
+		Parameters: func() [][]byte {
+			parameters := make([][]byte, len(msg.Parameters))
+			for i := range msg.Parameters {
+				if msg.Parameters[i] == nil {
+					parameters[i] = nil
+				} else {
+					parameters[i] = make([]byte, len(msg.Parameters[i]))
+					copy(parameters[i], msg.Parameters[i])
+				}
+			}
+			return parameters
+		}(),
+		ResultFormatCodes: make([]int16, len(msg.ResultFormatCodes)),
+	}
+	copy(msgcopy.ParameterFormatCodes, msg.ParameterFormatCodes)
+	copy(msgcopy.ResultFormatCodes, msg.ResultFormatCodes)
+
+	c.Mutex.Lock()
+	c.hook = hook
+	c.bind = msgcopy
+	c.key = cachekey
+	c.Mutex.Unlock()
+
+	// Cache key needs to be checked here since if there's any cache hit, we need to stop sending any
+	// request further to the backend, since otherwise the request sent to the backend might be "incorrect" in that
+	// some request states would get skipped
+	if msgs, ok := c.Client.Get(key(cachekey, hook.keySuffix)); ok {
+		rowDescription, datarows, command, ready := msgs.ToCommand()
+		c.Mutex.Lock()
+		defer c.Mutex.Unlock()
+		if c.cached {
+			terminate(errChan, errors.New("invalid 'Bind' command sent from frontend, already bound"))
+			return false
+		}
+		c.cached, c.rowDescription, c.dataRow, c.commandComplete, c.readyForQuery = true, rowDescription, datarows, command, ready
+		if PGPROXY_VERBOSE {
+			slog.Info("pgproxy_cache_hit", "key", key(c.key, c.hook.keySuffix))
+		}
+		return false
+	}
+
+	// On any cache error, just forward the message to backend & skip any cache
+	return true
+}
+
+func (c *CacheBuffer) CacheBackend(msg pgproto3.BackendMessage, errChan chan<- error) {
+	switch msg := msg.(type) {
+	case *pgproto3.RowDescription:
+		c.Mutex.Lock()
+		defer c.Mutex.Unlock()
+		if c.cached {
+			terminate(errChan, errors.New("invalid 'RowDescription' message received from backend on cached request"))
+			return
+		} else if c.bind == nil {
+			return
+		}
+		c.rowDescription = &pgproto3.RowDescription{
+			Fields: make([]pgproto3.FieldDescription, len(msg.Fields)),
+		}
+		copy(c.rowDescription.Fields, msg.Fields)
+		for i := range c.rowDescription.Fields {
+			if c.rowDescription.Fields[i].Name != nil {
+				c.rowDescription.Fields[i].Name = make([]byte, len(msg.Fields[i].Name))
+				copy(c.rowDescription.Fields[i].Name, msg.Fields[i].Name)
+			}
+		}
+	case *pgproto3.DataRow:
+		c.Mutex.Lock()
+		defer c.Mutex.Unlock()
+		if c.cached {
+			terminate(errChan, errors.New("invalid 'DataRow' message received from backend on cached request"))
+			return
+		} else if c.bind == nil {
+			return
+		}
+		c.dataRow = append(c.dataRow, &pgproto3.DataRow{
+			Values: func() [][]byte {
+				values := make([][]byte, len(msg.Values))
+				for i := range msg.Values {
+					if msg.Values[i] == nil {
+						values[i] = nil
+					} else {
+						values[i] = make([]byte, len(msg.Values[i]))
+						copy(values[i], msg.Values[i])
+					}
+				}
+				return values
+			}(),
+		})
+	case *pgproto3.CommandComplete:
+		c.Mutex.Lock()
+		defer c.Mutex.Unlock()
+		if c.cached {
+			terminate(errChan, errors.New("invalid 'CommandComplete' message received from backend on cached request"))
+			return
+		} else if c.bind == nil {
+			return
+		}
+		c.commandComplete = &pgproto3.CommandComplete{
+			CommandTag: make([]byte, len(msg.CommandTag)),
+		}
+		copy(c.commandComplete.CommandTag, msg.CommandTag)
+	case *pgproto3.ReadyForQuery:
+		c.Mutex.Lock()
+		if c.cached {
+			terminate(errChan, errors.New("invalid 'ReadyForQuery' message received from backend on cached request"))
+			c.Mutex.Unlock()
+			return
+		} else if c.bind == nil {
+			c.Mutex.Unlock()
+			return
+		}
+		key, val := key(c.key, c.hook.keySuffix), NewCache(c.rowDescription, c.dataRow, c.commandComplete, msg)
+		c.bind, c.key, c.dataRow, c.commandComplete, c.readyForQuery = nil, "", nil, nil, nil
+		c.Mutex.Unlock()
+		if err := c.Client.Set(key, val); err != nil {
+			slog.Error("pgproxy_cache_set_err", "err", err)
+		}
+	}
+}
+
+type hook struct {
+	noCache    bool
+	keySuffix  string
+	invalidate []string
+}
+
+func newHook(msg *pgproto3.Bind) hook {
+	def := hook{
+		noCache:    false,
+		keySuffix:  "DEFAULT",
+		invalidate: nil,
+	}
+	if !PGPROXY_ENABLE_PARAMETER_HOOK {
+		return def
+	}
+	var p string
+	if PGPROXY_PARAMETER_HOOK_POSITION == "first" {
+		if !valid(msg.Parameters[0]) {
+			return def
+		}
+		p = string(msg.Parameters[0])
+	} else if PGPROXY_PARAMETER_HOOK_POSITION == "last" {
+		if !valid(msg.Parameters[len(msg.Parameters)-1]) {
+			return def
+		}
+		p = string(msg.Parameters[len(msg.Parameters)-1])
+	} else {
+		slog.Error("pgproxy_parameter_hook_position", "unknown", PGPROXY_PARAMETER_HOOK_POSITION)
+		if !valid(msg.Parameters[0]) {
+			return def
+		}
+		p = string(msg.Parameters[0])
+	}
+	if !strings.HasPrefix(p, "PGPROXY,") {
+		slog.Error("pgproxy_parameter_hook_prefix", "invalid_prefix", p)
+		return def
+	}
+	return def.parse(p)
+}
+
+func (h hook) parse(p string) hook {
+	for _, config := range strings.Split(p, ",") {
+		if config == "NO_CACHE" {
+			h.noCache = true
+		} else if strings.HasPrefix(config, "CACHE_KEY:") {
+			h.keySuffix = strings.TrimPrefix(config, "CACHE_KEY:")
+		} else if strings.HasPrefix(config, "INVALIDATE:") {
+			h.invalidate = strings.Split(strings.TrimPrefix(config, "INVALIDATE:"), ",")
+		} else {
+			slog.Error("pgproxy_parameter_hook", "unknown_hook", config)
+		}
+	}
+	return h
+}
+
+func valid(p []byte) bool {
+	if !utf8.Valid(p) {
+		slog.Error("pgproxy_parameter_hook_invalid", "invalid_string", base64.RawStdEncoding.EncodeToString(p))
+		return false
+	}
+	return true
+}
+
+// Sets the assigned parameter hook into empty string
+func clearHookParameter(msg *pgproto3.Bind) {
+	if !PGPROXY_ENABLE_PARAMETER_HOOK {
+		return
+	}
+	if PGPROXY_PARAMETER_HOOK_POSITION == "first" {
+		if !valid(msg.Parameters[0]) {
+			return
+		}
+		msg.Parameters[0] = []byte("")
+	} else if PGPROXY_PARAMETER_HOOK_POSITION == "last" {
+		if !valid(msg.Parameters[len(msg.Parameters)-1]) {
+			return
+		}
+		msg.Parameters[len(msg.Parameters)-1] = []byte("")
+	}
+}
+
+func key(key, suffix string) string {
+	// TODO: might need to be able to configure the prefixed `PGPROXY` key. It is currently just
+	// set so we don't conflict with keys from other system
+	return fmt.Sprintf("PGPROXY:%s:%s", suffix, key)
+}
+
+func hash(b []byte) string {
+	hash := sha256.New()
+	hash.Write(b)
+	return base64.RawStdEncoding.EncodeToString(hash.Sum(nil))
+}
+
+// When a request is cached, we'll reply with a pre-determined set of messages here
+//
+// Returns whether the whole request cache is valid or not. If false, we'll
+// forward the whole buffered request to backend, so current query can be continued as usual
+func sendCache(
+	addr string,
+	backend *pgproto3.Backend,
+	describe *pgproto3.Describe,
+	rowDescription *pgproto3.RowDescription,
+	datarows []*pgproto3.DataRow,
+	command *pgproto3.CommandComplete,
+	ready *pgproto3.ReadyForQuery,
+	errChan chan<- error,
+) bool {
+	backend.Send(&pgproto3.BindComplete{})
+	if err := backend.Flush(); err != nil {
+		terminate(errChan, errors.Join(errors.New("error when sending message to frontend (BindComplete cached)"), err))
+	}
+	if PGPROXY_VERBOSE {
+		b, _ := json.Marshal(&pgproto3.BindComplete{})
+		slog.Info("B", "addr", addr, "data", b, "cached", true)
+	}
+	if describe != nil {
+		// The incoming request contains `Describe` request, but the cache doesn't have
+		// the corresponding `RowDescription` cached, so we'll just release the buffer instead
+		if rowDescription == nil {
+			return false
+		}
+		backend.Send(rowDescription)
+		if err := backend.Flush(); err != nil {
+			terminate(errChan, errors.Join(errors.New("error when sending message to frontend (BindComplete cached)"), err))
+		}
+		if PGPROXY_VERBOSE {
+			b, _ := json.Marshal(rowDescription)
+			slog.Info("B", "addr", addr, "data", b, "cached", true)
+		}
+	}
+	for _, msg := range datarows {
+		backend.Send(msg)
+		if err := backend.Flush(); err != nil {
+			terminate(errChan, errors.Join(errors.New("error when sending message to frontend (DataRow cached)"), err))
+		}
+		if PGPROXY_VERBOSE {
+			b, _ := json.Marshal(msg)
+			slog.Info("B", "addr", addr, "data", b, "cached", true)
+		}
+	}
+	backend.Send(command)
+	if err := backend.Flush(); err != nil {
+		terminate(errChan, errors.Join(errors.New("error when sending message to frontend (CommandComplete cached)"), err))
+	}
+	if PGPROXY_VERBOSE {
+		b, _ := json.Marshal(command)
+		slog.Info("B", "addr", addr, "data", b, "cached", true)
+	}
+	backend.Send(ready)
+	if err := backend.Flush(); err != nil {
+		terminate(errChan, errors.Join(errors.New("error when sending message to frontend (ReadyForQuery cached)"), err))
+	}
+	if PGPROXY_VERBOSE {
+		b, _ := json.Marshal(ready)
+		slog.Info("B", "addr", addr, "data", b, "cached", true)
+	}
+	return true
+}
+
+func invalidate(client CacheI, keys []string) {
+	for _, key := range keys {
+		go client.DelPattern(key)
+	}
+}
+
+type Cache struct {
+	RowDescription  *string  `json:"row_description,omitempty"`
+	DataRow         []string `json:"data_row"`
+	CommandComplete string   `json:"command_complete"`
+	ReadyForQuery   string   `json:"ready_for_query"`
+}
+
+func NewCache(
+	rd *pgproto3.RowDescription,
+	dr []*pgproto3.DataRow,
+	cc *pgproto3.CommandComplete,
+	rfq *pgproto3.ReadyForQuery,
+) Cache {
+	var c Cache
+	if rd == nil {
+		c.RowDescription = nil
+	} else {
+		e, err := rd.Encode(nil)
+		if err != nil {
+			panic(err)
+		}
+		c.RowDescription = ref(base64.StdEncoding.EncodeToString(e))
+	}
+	c.DataRow = make([]string, len(dr))
+	for i := range dr {
+		e, err := dr[i].Encode(nil)
+		if err != nil {
+			panic(err)
+		}
+		c.DataRow[i] = base64.StdEncoding.EncodeToString(e)
+	}
+	{
+		e, err := cc.Encode(nil)
+		if err != nil {
+			panic(err)
+		}
+		c.CommandComplete = base64.StdEncoding.EncodeToString(e)
+	}
+	{
+		e, err := rfq.Encode(nil)
+		if err != nil {
+			panic(err)
+		}
+		c.ReadyForQuery = base64.StdEncoding.EncodeToString(e)
+	}
+	return c
+}
+
+func (c Cache) ToCommand() (
+	*pgproto3.RowDescription,
+	[]*pgproto3.DataRow,
+	*pgproto3.CommandComplete,
+	*pgproto3.ReadyForQuery,
+) {
+	rd, dr, cc, rfq := new(pgproto3.RowDescription), make([]*pgproto3.DataRow, 0), new(pgproto3.CommandComplete), new(pgproto3.ReadyForQuery)
+	if c.RowDescription == nil {
+		rd = nil
+	} else {
+		d, err := base64.StdEncoding.DecodeString(*c.RowDescription)
+		if err != nil {
+			panic(err)
+		}
+		// Skip the first 5 bytes -- `Decode` expects the message to not contain the 1 byte message type and 4 byte length
+		if err := rd.Decode(d[5:]); err != nil {
+			panic(err)
+		}
+	}
+	for i := range c.DataRow {
+		d, err := base64.StdEncoding.DecodeString(c.DataRow[i])
+		if err != nil {
+			panic(err)
+		}
+		msg := new(pgproto3.DataRow)
+		if err := msg.Decode(d[5:]); err != nil {
+			panic(err)
+		}
+		dr = append(dr, msg)
+	}
+	{
+		d, err := base64.StdEncoding.DecodeString(c.CommandComplete)
+		if err != nil {
+			panic(err)
+		}
+		if err := cc.Decode(d[5:]); err != nil {
+			panic(err)
+		}
+	}
+	{
+		d, err := base64.StdEncoding.DecodeString(c.ReadyForQuery)
+		if err != nil {
+			panic(err)
+		}
+		if err := rfq.Decode(d[5:]); err != nil {
+			panic(err)
+		}
+	}
+	return rd, dr, cc, rfq
+}
+
+type CacheRedis struct {
+	client *redis.Client
+}
+
+func NewCacheRedis(client *redis.Client) *CacheRedis {
+	return &CacheRedis{client: client}
+}
+
+func (c *CacheRedis) Get(key string) (*Cache, bool) {
+	// This context is a bit iffy -- a timed-out connection would just be closed immediately
+	// by the apps or database, so we'll just put 1 second here so at least this doesn't get to
+	// run for too long
+	ctx, cancel := context.WithTimeout(context.Background(), (1 * time.Second))
+	defer cancel()
+	b, err := c.client.Get(ctx, key).Bytes()
+	if err != nil {
+		if err != redis.Nil {
+			slog.Error("pgproxy_cache_get", "err", err)
+		}
+		return nil, false
+	}
+	var decoded Cache
+	if err := json.Unmarshal(b, &decoded); err != nil {
+		slog.Error("pgproxy_cache_get_decode", "err", err)
+		return nil, false
+	}
+	return &decoded, true
+}
+
+func (c *CacheRedis) Set(key string, val Cache) error {
+	// This context is a bit iffy -- a timed-out connection would just be closed immediately
+	// by the apps or database, so we'll just put 1 second here so at least this doesn't get to
+	// run for too long
+	ctx, cancel := context.WithTimeout(context.Background(), (1 * time.Second))
+	defer cancel()
+	ttl := func(ttl, jitter int64) time.Duration {
+		jitter = int64(rand.Intn(max(int(jitter), 1)))
+		return time.Duration(ttl+jitter) * time.Second
+	}
+	b, err := json.Marshal(val)
+	if err != nil {
+		panic(err) // Should not happen unless the cached data is manually mucked around
+	}
+	return c.client.SetEx(ctx, key, b, ttl(PGPROXY_CACHE_TTL_SECOND, PGPROXY_CACHE_TTL_JITTER_SECOND)).Err()
+}
+
+func (c *CacheRedis) DelPattern(key string) {
+	cursor, total, keys := uint64(0), uint64(0), make([]string, 0)
+	for {
+		k, c, err := c.client.Scan(context.Background(), cursor, fmt.Sprintf("*%s*", key), 1000).Result()
+		if err != nil {
+			slog.Error("pgproxy_cache_del_scan", "err", err)
+			return
+		}
+		total, keys = (total + uint64(len(k))), append(keys, k...)
+		if c == 0 {
+			break
+		}
+		cursor = c
+	}
+	if err := c.client.Del(context.Background(), keys...).Err(); err != nil {
+		slog.Error("pgproxy_cache_del", "err", err)
+	}
+}
+
+type CacheMemory struct {
+	*sync.Mutex
+	data map[string]struct {
+		ttl time.Time
+		val Cache
+	}
+}
+
+func NewCacheMemory() *CacheMemory {
+	mem := &CacheMemory{Mutex: new(sync.Mutex), data: map[string]struct {
+		ttl time.Time
+		val Cache
+	}{}}
+	go mem.gc()
+	return mem
+}
+
+func (c *CacheMemory) Get(key string) (*Cache, bool) {
+	c.Mutex.Lock()
+	defer c.Mutex.Unlock()
+	val, ok := c.data[key]
+	if !ok {
+		return nil, false
+	}
+	return &val.val, true
+}
+
+func (c *CacheMemory) Set(key string, val Cache) error {
+	ttl := func(ttl, jitter int64) time.Duration {
+		jitter = int64(rand.Intn(max(int(jitter), 1)))
+		return time.Duration(ttl+jitter) * time.Second
+	}
+	c.data[key] = struct {
+		ttl time.Time
+		val Cache
+	}{
+		ttl: time.Now().Add(ttl(PGPROXY_CACHE_TTL_SECOND, PGPROXY_CACHE_TTL_JITTER_SECOND)),
+		val: val,
+	}
+	return nil
+}
+
+func (c *CacheMemory) DelPattern(key string) {
+	c.Mutex.Lock()
+	defer c.Mutex.Unlock()
+	for k := range c.data {
+		if strings.Contains(k, key) {
+			delete(c.data, k)
+		}
+	}
+}
+
+func (c *CacheMemory) gc() {
+	c.Mutex.Lock()
+	defer c.Mutex.Unlock()
+	now := time.Now()
+	for k, v := range c.data {
+		if v.ttl.Before(now) {
+			delete(c.data, k)
+		}
+	}
+}
+
+func ref[T any](v T) *T {
+	return &v
+}
