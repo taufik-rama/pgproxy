@@ -80,7 +80,7 @@ func connect() {
         // Create in-memory "network connection"
         app, frontend := net.Pipe()
 
-        // Dial to the database like what this would do
+        // Dial to the database normally
         server, err := net.Dial("tcp", net.JoinHostPort(config.ConnConfig.Host, strconv.Itoa(int(config.ConnConfig.Port))))
         if err != nil {
             return nil, err
@@ -162,7 +162,7 @@ stmt, err := db.Prepare("...")
 if err != nil {
     panic(err)
 }
-rows, err := stmt.QueryContext(ctx, "PGPROXY") // <-- Here
+rows, err := stmt.QueryContext(ctx, "PGPROXY,NO_CACHE,...", ... /* query parameters */) // <-- Here
 if err != nil {
     panic(err)
 }
@@ -170,8 +170,6 @@ if err != nil {
 ```
 
 Basically, if this configuration is enabled, then pgproxy will look at one of the statement parameter & try to parse it as an option for some custom behaviour
-
-TODO: explain all of the available options here
 
 The way that it _could_ integrate at least nicely with existing DB queries is by just having a "noop" condition for that optional values
 
@@ -187,3 +185,5 @@ WHERE
 ```
 
 By default the hook checks for the first parameter
+
+### TODO: explain all of the available hook options here
