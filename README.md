@@ -81,7 +81,7 @@ func connect() {
         app, frontend := net.Pipe()
 
         // Dial to the database normally
-        server, err := net.Dial("tcp", net.JoinHostPort(config.ConnConfig.Host, strconv.Itoa(int(config.ConnConfig.Port))))
+        server, err := net.Dial(network, addr)
         if err != nil {
             return nil, err
         }
@@ -93,7 +93,7 @@ func connect() {
             Username: "...",
             Password: "...",
         })
-        if err := redis.Ping(context.Background()).Err(); err != nil {
+        if err := redis.Ping(ctx).Err(); err != nil {
             panic(err)
         }
 
@@ -105,18 +105,18 @@ func connect() {
         return app, nil
     }
 
-    conn, err := pgxpool.NewWithConfig(context.Background(), config)
-    if err != nil {
-        panic(err)
-    }
-
     // Bunch of configuration that you can tune
-    pgproxy.PGPROXY_VERBOSE = true
+    pgproxy.PGPROXY_LOG_LEVEL = slog.LevelDebug
     pgproxy.PGPROXY_ENABLE_CACHE = true
     pgproxy.PGPROXY_CACHE_TTL_SECOND = 60
     pgproxy.PGPROXY_CACHE_TTL_JITTER_SECOND = 10
 
     // `conn` should just be able to be used like normal from here
+    conn, err := pgxpool.NewWithConfig(context.Background(), config)
+    if err != nil {
+        panic(err)
+    }
+
     // ...
 }
 
@@ -162,7 +162,7 @@ stmt, err := db.Prepare("...")
 if err != nil {
     panic(err)
 }
-rows, err := stmt.QueryContext(ctx, "PGPROXY,NO_CACHE,...", ... /* query parameters */) // <-- Here
+rows, err := stmt.QueryContext(ctx, "PGPROXY,NO_CACHE,..." /* <-- Here */, ... /* normal query parameters */)
 if err != nil {
     panic(err)
 }
@@ -171,7 +171,7 @@ if err != nil {
 
 Basically, if this configuration is enabled, then pgproxy will look at one of the statement parameter & try to parse it as an option for some custom behaviour
 
-The way that it _could_ integrate at least nicely with existing DB queries is by just having a "noop" condition for that optional values
+The way that it _could_ integrate at least nicely with existing DB queries is by just having a "noop" condition for that hook values
 
 ```sql
 SELECT

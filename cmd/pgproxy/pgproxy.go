@@ -16,9 +16,16 @@ import (
 
 func main() {
 	{
-		val, _ := os.LookupEnv("PGPROXY_VERBOSE")
-		if val, err := strconv.ParseBool(val); err == nil {
-			pgproxy.PGPROXY_VERBOSE = val
+		val, _ := os.LookupEnv("PGPROXY_LOG_LEVEL")
+		switch strings.ToLower(val) {
+		case "debug":
+			pgproxy.PGPROXY_LOG_LEVEL = slog.LevelDebug
+		case "info":
+			pgproxy.PGPROXY_LOG_LEVEL = slog.LevelInfo
+		case "error":
+			pgproxy.PGPROXY_LOG_LEVEL = slog.LevelError
+		default:
+			pgproxy.PGPROXY_LOG_LEVEL = slog.LevelInfo
 		}
 		val, _ = os.LookupEnv("PGPROXY_ENABLE_CACHE")
 		if val, err := strconv.ParseBool(val); err == nil {
@@ -90,10 +97,14 @@ func main() {
 			}
 			panic(err)
 		}
-		slog.Info("client_accept", "addr", client.RemoteAddr().String())
+		if pgproxy.PGPROXY_LOG_LEVEL <= slog.LevelInfo {
+			slog.Info("client_accept", "addr", client.RemoteAddr().String())
+		}
 		server, err := net.Dial(network(addrsrv), addrsrv)
 		if err != nil {
-			slog.Error("server_dial", "error", err)
+			if pgproxy.PGPROXY_LOG_LEVEL <= slog.LevelError {
+				slog.Error("server_dial", "error", err)
+			}
 			_ = client.Close()
 			return
 		}

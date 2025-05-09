@@ -14,8 +14,8 @@ import (
 )
 
 var (
-	// Prints each messages received from frontend and backend, encoded into JSON
-	PGPROXY_VERBOSE bool
+	// Some logging level for troubleshooting
+	PGPROXY_LOG_LEVEL slog.Level
 )
 
 type Proxy struct {
@@ -49,7 +49,7 @@ func runf(cache *CacheBuffer, addr string, frontend *pgproto3.Frontend, backend 
 			terminate(errChan, errors.Join(errors.New("invalid message received from frontend (startup)"), err))
 			return
 		}
-		if PGPROXY_VERBOSE {
+		if PGPROXY_LOG_LEVEL <= slog.LevelDebug {
 			b, _ := json.Marshal(startup)
 			slog.Info("F", "addr", addr, "data", b)
 		}
@@ -71,7 +71,7 @@ func runf(cache *CacheBuffer, addr string, frontend *pgproto3.Frontend, backend 
 			terminate(errChan, errors.Join(errors.New("invalid message received from frontend"), err))
 			return
 		}
-		if PGPROXY_VERBOSE {
+		if PGPROXY_LOG_LEVEL <= slog.LevelDebug {
 			b, _ := json.Marshal(msg)
 			slog.Info("F", "addr", addr, "data", b)
 		}
@@ -94,7 +94,7 @@ func runb(cache *CacheBuffer, addr string, frontend *pgproto3.Frontend, backend 
 			terminate(errChan, errors.Join(errors.New("invalid message received from backend"), err))
 			return
 		}
-		if PGPROXY_VERBOSE {
+		if PGPROXY_LOG_LEVEL <= slog.LevelDebug {
 			b, _ := json.Marshal(msg)
 			slog.Info("B", "addr", addr, "data", b)
 		}
