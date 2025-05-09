@@ -144,7 +144,7 @@ func (c *CacheBuffer) CacheFrontend(
 			errChan,
 		) {
 			// Cache data issue, we'll release the buffered messages to the backend & let the query run as normal
-			if PGPROXY_VERBOSE {
+			if PGPROXY_LOG_LEVEL <= slog.LevelInfo {
 				slog.Info("pgproxy_cache_hit_but_invalid", "key", key)
 			}
 			frontend.Send(bind)
@@ -235,7 +235,7 @@ func (c *CacheBuffer) cacheFrontendBind(msg *pgproto3.Bind, errChan chan<- error
 			return false
 		}
 		c.cached, c.rowDescription, c.dataRow, c.commandComplete, c.readyForQuery = true, rowDescription, datarows, command, ready
-		if PGPROXY_VERBOSE {
+		if PGPROXY_LOG_LEVEL <= slog.LevelInfo {
 			slog.Info("pgproxy_cache_hit", "key", key(c.key, c.hook.keySuffix))
 		}
 		return false
@@ -432,7 +432,7 @@ func sendCache(
 	if err := backend.Flush(); err != nil {
 		terminate(errChan, errors.Join(errors.New("error when sending message to frontend (BindComplete cached)"), err))
 	}
-	if PGPROXY_VERBOSE {
+	if PGPROXY_LOG_LEVEL <= slog.LevelDebug {
 		b, _ := json.Marshal(&pgproto3.BindComplete{})
 		slog.Info("B", "addr", addr, "data", b, "cached", true)
 	}
@@ -446,7 +446,7 @@ func sendCache(
 		if err := backend.Flush(); err != nil {
 			terminate(errChan, errors.Join(errors.New("error when sending message to frontend (BindComplete cached)"), err))
 		}
-		if PGPROXY_VERBOSE {
+		if PGPROXY_LOG_LEVEL <= slog.LevelDebug {
 			b, _ := json.Marshal(rowDescription)
 			slog.Info("B", "addr", addr, "data", b, "cached", true)
 		}
@@ -456,7 +456,7 @@ func sendCache(
 		if err := backend.Flush(); err != nil {
 			terminate(errChan, errors.Join(errors.New("error when sending message to frontend (DataRow cached)"), err))
 		}
-		if PGPROXY_VERBOSE {
+		if PGPROXY_LOG_LEVEL <= slog.LevelDebug {
 			b, _ := json.Marshal(msg)
 			slog.Info("B", "addr", addr, "data", b, "cached", true)
 		}
@@ -465,7 +465,7 @@ func sendCache(
 	if err := backend.Flush(); err != nil {
 		terminate(errChan, errors.Join(errors.New("error when sending message to frontend (CommandComplete cached)"), err))
 	}
-	if PGPROXY_VERBOSE {
+	if PGPROXY_LOG_LEVEL <= slog.LevelDebug {
 		b, _ := json.Marshal(command)
 		slog.Info("B", "addr", addr, "data", b, "cached", true)
 	}
@@ -473,7 +473,7 @@ func sendCache(
 	if err := backend.Flush(); err != nil {
 		terminate(errChan, errors.Join(errors.New("error when sending message to frontend (ReadyForQuery cached)"), err))
 	}
-	if PGPROXY_VERBOSE {
+	if PGPROXY_LOG_LEVEL <= slog.LevelDebug {
 		b, _ := json.Marshal(ready)
 		slog.Info("B", "addr", addr, "data", b, "cached", true)
 	}
