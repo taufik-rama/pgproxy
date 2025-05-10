@@ -53,7 +53,7 @@ PGPROXY_ENABLE_CACHE=true go build ./cmd/pgproxy/... && pgproxy
 
 ### TODO: lists out configurations
 
-### In-memory proxy
+### In-memory proxy (pgx)
 
 ```golang
 import (
@@ -67,7 +67,6 @@ import (
 // ...
 
 func connect() {
-
     // ...
     
     config, err := pgxpool.ParseConfig("...")
@@ -120,6 +119,75 @@ func connect() {
     // ...
 }
 
+```
+
+### In-memory proxy (lib/pq)
+
+```golang
+import (
+    // ...
+	"github.com/lib/pq"
+	"github.com/redis/go-redis/v9"
+	"github.com/taufik-rama/pgproxy"
+    // ...
+)
+
+// ...
+
+func connect() {
+    // ...
+
+    redis := redis.NewClient(&redis.Options{
+        Addr:     "127.0.0.1:6379",
+        Username: "...",
+        Password: "...",
+    })
+    if err := redis.Ping(ctx).Err(); err != nil {
+        panic(err)
+    }
+
+    sql.Register("postgres-pgproxy", &Driver{redis}) // You can rename this driver freely
+    pgproxy.PGPROXY_LOG_LEVEL = slog.LevelDebug
+    pgproxy.PGPROXY_ENABLE_CACHE = true
+
+    db, err := sql.Open("postgres-pgproxy", "...")
+    if err != nil {
+        panic(err)
+    }
+
+    // ...
+}
+
+// ...
+
+type Driver struct {
+	*redis.Client
+}
+
+var _ pq.Dialer = &Driver{}
+var _ pq.DialerContext = &Driver{}
+
+func (d *Driver) Open(name string) (driver.Conn, error) {
+	return pq.DialOpen(d, name)
+}
+
+func (d *Driver) Dial(network, address string) (net.Conn, error) {
+	return d.DialContext(context.Background(), network, address)
+}
+
+func (d *Driver) DialTimeout(network, address string, timeout time.Duration) (net.Conn, error) {
+	return d.DialContext(context.Background(), network, address)
+}
+
+func (d *Driver) DialContext(ctx context.Context, network, address string) (net.Conn, error) {
+	app, frontend := net.Pipe()
+	server, err := net.Dial(network, address)
+	if err != nil {
+		return nil, err
+	}
+	go pgproxy.NewProxy(frontend, server).Run(pgproxy.NewCacheBuffer(pgproxy.NewCacheRedis(d.Client)))
+	return app, nil
+}
 ```
 
 ## Implementation
