@@ -104,7 +104,7 @@ func (c *CacheBuffer) CacheFrontend(
 		c.Mutex.Lock()
 		defer c.Mutex.Unlock()
 		if c.frontend.cached == nil {
-			c.resetf()
+			c.resetf(false)
 			return true
 		}
 		c.frontend.describe = &pgproto3.Describe{
@@ -116,7 +116,7 @@ func (c *CacheBuffer) CacheFrontend(
 		c.Mutex.Lock()
 		defer c.Mutex.Unlock()
 		if c.frontend.cached == nil {
-			c.resetf()
+			c.resetf(false)
 			return true
 		}
 		c.frontend.execute = &pgproto3.Execute{
@@ -127,12 +127,12 @@ func (c *CacheBuffer) CacheFrontend(
 	case *pgproto3.Sync:
 		c.Mutex.Lock()
 		if c.frontend.cached == nil {
-			c.resetf()
+			c.resetf(false)
 			c.Mutex.Unlock()
 			return true
 		}
 		key, buf := key(c.key, c.hook.keySuffix), c.frontend
-		c.resetf()
+		c.resetf(true)
 		c.Mutex.Unlock()
 		if !sendCache(
 			addr,
@@ -362,7 +362,16 @@ func (c *CacheBuffer) CacheBackend(msg pgproto3.BackendMessage, errChan chan<- e
 	}
 }
 
-func (c *CacheBuffer) resetf() {
+func (c *CacheBuffer) resetf(cached bool) {
+	// If the frontend request is fully cached, then we'll
+	// also reset the whole buffer data.
+	//
+	// This is because the backend reset is triggered on backend listener,
+	// but it is not triggered if the frontend is cached since no request
+	// will be forwarded to the backend, so we'll need to reset it here
+	if cached {
+		c.resetb()
+	}
 	c.frontend = buff{}
 }
 
