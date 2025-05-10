@@ -74,6 +74,7 @@ type CacheBuffer struct {
 
 	// Buffered postgres commands
 	cached          bool                      // is current request cached
+	query           *pgproto3.Query           // frontend
 	bind            *pgproto3.Bind            // frontend
 	describe        *pgproto3.Describe        // frontend
 	execute         *pgproto3.Execute         // frontend
@@ -99,6 +100,8 @@ func (c *CacheBuffer) CacheFrontend(
 	errChan chan<- error,
 ) bool {
 	switch msg := msg.(type) {
+	case *pgproto3.Query:
+		return c.cacheFrontendQuery(msg, errChan)
 	case *pgproto3.Bind:
 		return c.cacheFrontendBind(msg, errChan)
 	case *pgproto3.Describe:
@@ -126,12 +129,13 @@ func (c *CacheBuffer) CacheFrontend(
 	case *pgproto3.Sync:
 		c.Mutex.Lock()
 		if !c.cached {
+			c.resetf()
 			c.Mutex.Unlock()
 			return true
 		}
 		key := key(c.key, c.hook.keySuffix)
-		bind, describe, execute, rowDescription, datarow, command, ready := c.bind, c.describe, c.execute, c.rowDescription, c.dataRow, c.commandComplete, c.readyForQuery
-		c.cached, c.bind, c.describe, c.execute, c.dataRow, c.commandComplete, c.readyForQuery = false, nil, nil, nil, nil, nil, nil
+		query, bind, describe, execute, rowDescription, datarow, command, ready := c.query, c.bind, c.describe, c.execute, c.rowDescription, c.dataRow, c.commandComplete, c.readyForQuery
+		c.resetf()
 		c.Mutex.Unlock()
 		if !sendCache(
 			addr,
@@ -147,10 +151,18 @@ func (c *CacheBuffer) CacheFrontend(
 			if PGPROXY_LOG_LEVEL <= slog.LevelInfo {
 				slog.Info("pgproxy_cache_hit_but_invalid", "key", key)
 			}
-			frontend.Send(bind)
-			if err := frontend.Flush(); err != nil {
-				terminate(errChan, errors.Join(errors.New("error when sending message to backend (`Bind` command invalid cache)"), err))
-				return false
+			if query != nil {
+				frontend.Send(query)
+				if err := frontend.Flush(); err != nil {
+					terminate(errChan, errors.Join(errors.New("error when sending message to backend (`Query` command invalid cache)"), err))
+					return false
+				}
+			} else if bind != nil {
+				frontend.Send(bind)
+				if err := frontend.Flush(); err != nil {
+					terminate(errChan, errors.Join(errors.New("error when sending message to backend (`Bind` command invalid cache)"), err))
+					return false
+				}
 			}
 			if describe != nil {
 				frontend.Send(describe)
@@ -173,7 +185,7 @@ func (c *CacheBuffer) CacheFrontend(
 }
 
 func (c *CacheBuffer) cacheFrontendBind(msg *pgproto3.Bind, errChan chan<- error) bool {
-	hook := newHook(msg)
+	hook := newHookFromBind(msg)
 
 	// Invalidating cache key here might be a bit hacky: deleting the key *immediately* before the mutating query
 	// is executed means that another cache might get set which still have the stale data on the database.
@@ -232,6 +244,45 @@ func (c *CacheBuffer) cacheFrontendBind(msg *pgproto3.Bind, errChan chan<- error
 		defer c.Mutex.Unlock()
 		if c.cached {
 			terminate(errChan, errors.New("invalid 'Bind' command sent from frontend, already bound"))
+			return false
+		}
+		c.cached, c.rowDescription, c.dataRow, c.commandComplete, c.readyForQuery = true, rowDescription, datarows, command, ready
+		if PGPROXY_LOG_LEVEL <= slog.LevelInfo {
+			slog.Info("pgproxy_cache_hit", "key", key(c.key, c.hook.keySuffix))
+		}
+		return false
+	}
+
+	// On any cache error, just forward the message to backend & skip any cache
+	return true
+}
+
+func (c *CacheBuffer) cacheFrontendQuery(msg *pgproto3.Query, errChan chan<- error) bool {
+	hook := newHookFromQuery(msg)
+	encoded, err := msg.Encode(nil)
+	if err != nil {
+		terminate(errChan, errors.Join(errors.New("invalid frontend message"), err))
+		return false
+	}
+	cachekey, msgcopy := hash(encoded), &pgproto3.Query{
+		String: msg.String,
+	}
+
+	c.Mutex.Lock()
+	c.hook = hook
+	c.query = msgcopy
+	c.key = cachekey
+	c.Mutex.Unlock()
+
+	// Cache key needs to be checked here since if there's any cache hit, we need to stop sending any
+	// request further to the backend, since otherwise the request sent to the backend might be "incorrect" in that
+	// some request states would get skipped
+	if msgs, ok := c.Client.Get(key(cachekey, hook.keySuffix)); ok {
+		rowDescription, datarows, command, ready := msgs.ToCommand()
+		c.Mutex.Lock()
+		defer c.Mutex.Unlock()
+		if c.cached {
+			terminate(errChan, errors.New("invalid 'Query' command sent from frontend, already bound"))
 			return false
 		}
 		c.cached, c.rowDescription, c.dataRow, c.commandComplete, c.readyForQuery = true, rowDescription, datarows, command, ready
@@ -309,16 +360,29 @@ func (c *CacheBuffer) CacheBackend(msg pgproto3.BackendMessage, errChan chan<- e
 			c.Mutex.Unlock()
 			return
 		} else if c.bind == nil {
+			c.resetb()
+			c.Mutex.Unlock()
+			return
+		} else if c.commandComplete == nil { // Error query, just continue
+			c.resetb()
 			c.Mutex.Unlock()
 			return
 		}
 		key, val := key(c.key, c.hook.keySuffix), NewCache(c.rowDescription, c.dataRow, c.commandComplete, msg)
-		c.bind, c.key, c.dataRow, c.commandComplete, c.readyForQuery = nil, "", nil, nil, nil
+		c.resetb()
 		c.Mutex.Unlock()
 		if err := c.Client.Set(key, val); err != nil {
 			slog.Error("pgproxy_cache_set_err", "err", err)
 		}
 	}
+}
+
+func (c *CacheBuffer) resetf() {
+	c.cached, c.query, c.bind, c.describe, c.execute, c.dataRow, c.commandComplete, c.readyForQuery = false, nil, nil, nil, nil, nil, nil, nil
+}
+
+func (c *CacheBuffer) resetb() {
+	c.bind, c.key, c.dataRow, c.commandComplete, c.readyForQuery = nil, "", nil, nil, nil
 }
 
 type hook struct {
@@ -327,7 +391,7 @@ type hook struct {
 	invalidate []string
 }
 
-func newHook(msg *pgproto3.Bind) hook {
+func newHookFromBind(msg *pgproto3.Bind) hook {
 	def := hook{
 		noCache:    false,
 		keySuffix:  "DEFAULT",
@@ -359,6 +423,18 @@ func newHook(msg *pgproto3.Bind) hook {
 		return def
 	}
 	return def.parse(p)
+}
+
+func newHookFromQuery(msg *pgproto3.Query) hook {
+	def := hook{
+		noCache:    false,
+		keySuffix:  "DEFAULT",
+		invalidate: nil,
+	}
+	if !PGPROXY_ENABLE_PARAMETER_HOOK {
+		return def
+	}
+	return def
 }
 
 func (h hook) parse(p string) hook {
