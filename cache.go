@@ -145,9 +145,7 @@ func (c *CacheBuffer) CacheFrontend(
 			errChan,
 		) {
 			// Cache data issue, we'll release the buffered messages to the backend & let the query run as normal
-			if PGPROXY_LOG_LEVEL <= slog.LevelInfo {
-				slog.Info("pgproxy_cache_hit_but_invalid", "key", key)
-			}
+			slog.Info("pgproxy_cache_hit_but_invalid", "key", key)
 			if buf.query != nil {
 				frontend.Send(buf.query)
 				if err := frontend.Flush(); err != nil {
@@ -227,6 +225,7 @@ func (c *CacheBuffer) cacheFrontendBind(msg *pgproto3.Bind, errChan chan<- error
 	copy(msgcopy.ResultFormatCodes, msg.ResultFormatCodes)
 
 	c.Mutex.Lock()
+	c.frontendQuery = true
 	c.hook = hook
 	c.key = cachekey
 	c.frontend.bind = msgcopy
@@ -244,9 +243,7 @@ func (c *CacheBuffer) cacheFrontendBind(msg *pgproto3.Bind, errChan chan<- error
 			return false
 		}
 		c.frontend.cached = &bufb{rowDescription, datarows, command, ready}
-		if PGPROXY_LOG_LEVEL <= slog.LevelInfo {
-			slog.Info("pgproxy_cache_hit", "key", key(c.key, c.hook.keySuffix))
-		}
+		slog.Info("pgproxy_cache_hit", "key", key(c.key, c.hook.keySuffix))
 		return false
 	}
 
@@ -266,6 +263,7 @@ func (c *CacheBuffer) cacheFrontendQuery(msg *pgproto3.Query, errChan chan<- err
 	}
 
 	c.Mutex.Lock()
+	c.frontendQuery = true
 	c.hook = hook
 	c.key = cachekey
 	c.frontend.query = msgcopy
@@ -283,9 +281,7 @@ func (c *CacheBuffer) cacheFrontendQuery(msg *pgproto3.Query, errChan chan<- err
 			return false
 		}
 		c.frontend.cached = &bufb{rowDescription, datarows, command, ready}
-		if PGPROXY_LOG_LEVEL <= slog.LevelInfo {
-			slog.Info("pgproxy_cache_hit", "key", key(c.key, c.hook.keySuffix))
-		}
+		slog.Info("pgproxy_cache_hit", "key", key(c.key, c.hook.keySuffix))
 		return false
 	}
 
@@ -336,6 +332,10 @@ func (c *CacheBuffer) CacheBackend(msg pgproto3.BackendMessage, errChan chan<- e
 	case *pgproto3.CommandComplete:
 		c.Mutex.Lock()
 		defer c.Mutex.Unlock()
+		if !c.frontendQuery {
+			c.resetb()
+			return
+		}
 		c.backend.commandComplete = &pgproto3.CommandComplete{
 			CommandTag: make([]byte, len(msg.CommandTag)),
 		}
@@ -347,9 +347,7 @@ func (c *CacheBuffer) CacheBackend(msg pgproto3.BackendMessage, errChan chan<- e
 			c.Mutex.Unlock()
 			return
 		} else if c.backend.commandComplete == nil { // Error query, just continue
-			if PGPROXY_LOG_LEVEL <= slog.LevelInfo {
-				slog.Info("pgproxy_database_command_not_complete", "key", key(c.key, c.hook.keySuffix))
-			}
+			slog.Info("pgproxy_database_command_not_complete", "key", key(c.key, c.hook.keySuffix))
 			c.resetb()
 			c.Mutex.Unlock()
 			return
@@ -357,6 +355,7 @@ func (c *CacheBuffer) CacheBackend(msg pgproto3.BackendMessage, errChan chan<- e
 		key, val := key(c.key, c.hook.keySuffix), NewCache(c.backend.rowDescription, c.backend.dataRow, c.backend.commandComplete, msg)
 		c.resetb()
 		c.Mutex.Unlock()
+		slog.Debug("pgproxy_cache_set", "key", key)
 		if err := c.Client.Set(key, val); err != nil {
 			slog.Error("pgproxy_cache_set_err", "err", err)
 		}
@@ -512,9 +511,9 @@ func sendCache(
 	if err := backend.Flush(); err != nil {
 		terminate(errChan, errors.Join(errors.New("error when sending message to frontend (BindComplete cached)"), err))
 	}
-	if PGPROXY_LOG_LEVEL <= slog.LevelDebug {
+	if slog.Default().Handler().Enabled(context.Background(), slog.LevelDebug) {
 		b, _ := json.Marshal(&pgproto3.BindComplete{})
-		slog.Info("B", "addr", addr, "data", b, "cached", true)
+		slog.Debug("B", "addr", addr, "data", b, "cached", true)
 	}
 	if describe != nil {
 		// The incoming request contains `Describe` request, but the cache doesn't have
@@ -526,9 +525,9 @@ func sendCache(
 		if err := backend.Flush(); err != nil {
 			terminate(errChan, errors.Join(errors.New("error when sending message to frontend (BindComplete cached)"), err))
 		}
-		if PGPROXY_LOG_LEVEL <= slog.LevelDebug {
+		if slog.Default().Handler().Enabled(context.Background(), slog.LevelDebug) {
 			b, _ := json.Marshal(rowDescription)
-			slog.Info("B", "addr", addr, "data", b, "cached", true)
+			slog.Debug("B", "addr", addr, "data", b, "cached", true)
 		}
 	}
 	for _, msg := range datarows {
@@ -536,32 +535,33 @@ func sendCache(
 		if err := backend.Flush(); err != nil {
 			terminate(errChan, errors.Join(errors.New("error when sending message to frontend (DataRow cached)"), err))
 		}
-		if PGPROXY_LOG_LEVEL <= slog.LevelDebug {
+		if slog.Default().Handler().Enabled(context.Background(), slog.LevelDebug) {
 			b, _ := json.Marshal(msg)
-			slog.Info("B", "addr", addr, "data", b, "cached", true)
+			slog.Debug("B", "addr", addr, "data", b, "cached", true)
 		}
 	}
 	backend.Send(command)
 	if err := backend.Flush(); err != nil {
 		terminate(errChan, errors.Join(errors.New("error when sending message to frontend (CommandComplete cached)"), err))
 	}
-	if PGPROXY_LOG_LEVEL <= slog.LevelDebug {
+	if slog.Default().Handler().Enabled(context.Background(), slog.LevelDebug) {
 		b, _ := json.Marshal(command)
-		slog.Info("B", "addr", addr, "data", b, "cached", true)
+		slog.Debug("B", "addr", addr, "data", b, "cached", true)
 	}
 	backend.Send(ready)
 	if err := backend.Flush(); err != nil {
 		terminate(errChan, errors.Join(errors.New("error when sending message to frontend (ReadyForQuery cached)"), err))
 	}
-	if PGPROXY_LOG_LEVEL <= slog.LevelDebug {
+	if slog.Default().Handler().Enabled(context.Background(), slog.LevelDebug) {
 		b, _ := json.Marshal(ready)
-		slog.Info("B", "addr", addr, "data", b, "cached", true)
+		slog.Debug("B", "addr", addr, "data", b, "cached", true)
 	}
 	return true
 }
 
 func invalidate(client CacheI, keys []string) {
 	for _, key := range keys {
+		slog.Debug("pgproxy_cache_del", "key", key)
 		go client.DelPattern(key)
 	}
 }
@@ -695,11 +695,6 @@ func (c *CacheRedis) Get(key string) (*Cache, bool) {
 }
 
 func (c *CacheRedis) Set(key string, val Cache) error {
-	// This context is a bit iffy -- a timed-out connection would just be closed immediately
-	// by the apps or database, so we'll just put 1 second here so at least this doesn't get to
-	// run for too long
-	ctx, cancel := context.WithTimeout(context.Background(), (1 * time.Second))
-	defer cancel()
 	ttl := func(ttl, jitter int64) time.Duration {
 		jitter = int64(rand.Intn(max(int(jitter), 1)))
 		return time.Duration(ttl+jitter) * time.Second
@@ -708,6 +703,11 @@ func (c *CacheRedis) Set(key string, val Cache) error {
 	if err != nil {
 		panic(err) // Should not happen unless the cached data is manually mucked around
 	}
+	// This context is a bit iffy -- a timed-out connection would just be closed immediately
+	// by the apps or database, so we'll just put 1 second here so at least this doesn't get to
+	// run for too long
+	ctx, cancel := context.WithTimeout(context.Background(), (1 * time.Second))
+	defer cancel()
 	return c.client.SetEx(ctx, key, b, ttl(PGPROXY_CACHE_TTL_SECOND, PGPROXY_CACHE_TTL_JITTER_SECOND)).Err()
 }
 

@@ -105,7 +105,6 @@ func connect() {
     }
 
     // Bunch of configuration that you can tune
-    pgproxy.PGPROXY_LOG_LEVEL = slog.LevelDebug
     pgproxy.PGPROXY_ENABLE_CACHE = true
     pgproxy.PGPROXY_CACHE_TTL_SECOND = 60
     pgproxy.PGPROXY_CACHE_TTL_JITTER_SECOND = 10
@@ -147,7 +146,6 @@ func connect() {
     }
 
     sql.Register("postgres-pgproxy", &Driver{redis}) // You can rename this driver freely
-    pgproxy.PGPROXY_LOG_LEVEL = slog.LevelDebug
     pgproxy.PGPROXY_ENABLE_CACHE = true
 
     db, err := sql.Open("postgres-pgproxy", "...")

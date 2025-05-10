@@ -19,13 +19,13 @@ func main() {
 		val, _ := os.LookupEnv("PGPROXY_LOG_LEVEL")
 		switch strings.ToLower(val) {
 		case "debug":
-			pgproxy.PGPROXY_LOG_LEVEL = slog.LevelDebug
+			slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug})))
 		case "info":
-			pgproxy.PGPROXY_LOG_LEVEL = slog.LevelInfo
+			slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo})))
 		case "error":
-			pgproxy.PGPROXY_LOG_LEVEL = slog.LevelError
+			slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError})))
 		default:
-			pgproxy.PGPROXY_LOG_LEVEL = slog.LevelInfo
+			slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo})))
 		}
 		val, _ = os.LookupEnv("PGPROXY_ENABLE_CACHE")
 		if val, err := strconv.ParseBool(val); err == nil {
@@ -97,14 +97,10 @@ func main() {
 			}
 			panic(err)
 		}
-		if pgproxy.PGPROXY_LOG_LEVEL <= slog.LevelInfo {
-			slog.Info("client_accept", "addr", client.RemoteAddr().String())
-		}
+		slog.Info("client_accept", "addr", client.RemoteAddr().String())
 		server, err := net.Dial(network(addrsrv), addrsrv)
 		if err != nil {
-			if pgproxy.PGPROXY_LOG_LEVEL <= slog.LevelError {
-				slog.Error("server_dial", "error", err)
-			}
+			slog.Error("server_dial", "error", err)
 			_ = client.Close()
 			return
 		}

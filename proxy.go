@@ -4,6 +4,7 @@
 package pgproxy
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
@@ -11,11 +12,6 @@ import (
 	"net"
 
 	"github.com/jackc/pgx/v5/pgproto3"
-)
-
-var (
-	// Some logging level for troubleshooting
-	PGPROXY_LOG_LEVEL slog.Level
 )
 
 type Proxy struct {
@@ -49,9 +45,9 @@ func runf(cache *CacheBuffer, addr string, frontend *pgproto3.Frontend, backend 
 			terminate(errChan, errors.Join(errors.New("invalid message received from frontend (startup)"), err))
 			return
 		}
-		if PGPROXY_LOG_LEVEL <= slog.LevelDebug {
+		if slog.Default().Handler().Enabled(context.Background(), slog.LevelDebug) {
 			b, _ := json.Marshal(startup)
-			slog.Info("F", "addr", addr, "data", b)
+			slog.Debug("F", "addr", addr, "data", b)
 		}
 		frontend.Send(startup)
 		if err := frontend.Flush(); err != nil {
@@ -71,9 +67,9 @@ func runf(cache *CacheBuffer, addr string, frontend *pgproto3.Frontend, backend 
 			terminate(errChan, errors.Join(errors.New("invalid message received from frontend"), err))
 			return
 		}
-		if PGPROXY_LOG_LEVEL <= slog.LevelDebug {
+		if slog.Default().Handler().Enabled(context.Background(), slog.LevelDebug) {
 			b, _ := json.Marshal(msg)
-			slog.Info("F", "addr", addr, "data", b)
+			slog.Debug("F", "addr", addr, "data", b)
 		}
 		if PGPROXY_ENABLE_CACHE && cache != nil && !cache.CacheFrontend(addr, msg, frontend, backend, errChan) {
 			continue
@@ -94,9 +90,9 @@ func runb(cache *CacheBuffer, addr string, frontend *pgproto3.Frontend, backend 
 			terminate(errChan, errors.Join(errors.New("invalid message received from backend"), err))
 			return
 		}
-		if PGPROXY_LOG_LEVEL <= slog.LevelDebug {
+		if slog.Default().Handler().Enabled(context.Background(), slog.LevelDebug) {
 			b, _ := json.Marshal(msg)
-			slog.Info("B", "addr", addr, "data", b)
+			slog.Debug("B", "addr", addr, "data", b)
 		}
 		if PGPROXY_ENABLE_CACHE && cache != nil {
 			cache.CacheBackend(msg, errChan)
