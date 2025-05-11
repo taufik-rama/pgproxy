@@ -188,6 +188,15 @@ func (c *CacheBuffer) CacheFrontend(
 }
 
 func (c *CacheBuffer) cacheFrontendBind(msg *pgproto3.Bind, errChan chan<- error) bool {
+	// Frontend message already bound -- current implementation doesn't support interleaved messages
+	c.Mutex.Lock()
+	if c.frontendQuery {
+		terminate(errChan, errors.New("pgproxy currently doesn't support interleaved messages"))
+		c.Mutex.Unlock()
+		return false
+	}
+	c.Mutex.Unlock()
+
 	hook := newHookFromBind(msg)
 
 	// Invalidating cache key here might be a bit hacky: deleting the key *immediately* before the mutating query
@@ -204,8 +213,6 @@ func (c *CacheBuffer) cacheFrontendBind(msg *pgproto3.Bind, errChan chan<- error
 		return true
 	}
 
-	// The whole command is used as the cache key with the exception of the hook parameter, if it is set
-	clearHookParameter(msg)
 	encoded, err := msg.Encode(nil)
 	if err != nil {
 		terminate(errChan, errors.Join(errors.New("invalid frontend message"), err))
@@ -260,6 +267,15 @@ func (c *CacheBuffer) cacheFrontendBind(msg *pgproto3.Bind, errChan chan<- error
 }
 
 func (c *CacheBuffer) cacheFrontendQuery(msg *pgproto3.Query, errChan chan<- error) bool {
+	// Frontend message already bound -- current implementation doesn't support interleaved messages
+	c.Mutex.Lock()
+	if c.frontendQuery {
+		terminate(errChan, errors.New("pgproxy currently doesn't support interleaved messages"))
+		c.Mutex.Unlock()
+		return false
+	}
+	c.Mutex.Unlock()
+
 	hook := newHookFromQuery(msg)
 	encoded, err := msg.Encode(nil)
 	if err != nil {
@@ -359,6 +375,13 @@ func (c *CacheBuffer) CacheBackend(msg pgproto3.BackendMessage, errChan chan<- e
 			c.resetb()
 			c.Mutex.Unlock()
 			return
+		} else if msg.TxStatus == 'T' { // Part of transaction, do not cache
+			if slog.Default().Handler().Enabled(context.Background(), slog.LevelDebug) {
+				slog.Debug("pgproxy_database_transaction_not_cached", "key", key(c.key, c.hook.keySuffix))
+			}
+			c.resetb()
+			c.Mutex.Unlock()
+			return
 		}
 		key, val := key(c.key, c.hook.keySuffix), NewCache(c.backend.rowDescription, c.backend.dataRow, c.backend.commandComplete, msg)
 		c.resetb()
@@ -442,7 +465,7 @@ func newHookFromBind(msg *pgproto3.Bind) hook {
 		slog.Error("pgproxy_parameter_hook_prefix", "invalid_prefix", p)
 		return def
 	}
-	return def.parse(p)
+	return def.parse(strings.TrimPrefix(p, "PGPROXY,"))
 }
 
 func newHookFromQuery(_ *pgproto3.Query) hook {
@@ -459,7 +482,9 @@ func newHookFromQuery(_ *pgproto3.Query) hook {
 
 func (h hook) parse(p string) hook {
 	for _, config := range strings.Split(p, ",") {
-		if config == "NO_CACHE" {
+		if config == "" {
+			continue
+		} else if config == "NO_CACHE" {
 			h.noCache = true
 		} else if strings.HasPrefix(config, "CACHE_KEY:") {
 			h.keySuffix = strings.TrimPrefix(config, "CACHE_KEY:")
@@ -478,24 +503,6 @@ func valid(p []byte) bool {
 		return false
 	}
 	return true
-}
-
-// Sets the assigned parameter hook into empty string
-func clearHookParameter(msg *pgproto3.Bind) {
-	if !PGPROXY_ENABLE_PARAMETER_HOOK {
-		return
-	}
-	if PGPROXY_PARAMETER_HOOK_POSITION == "first" {
-		if !valid(msg.Parameters[0]) {
-			return
-		}
-		msg.Parameters[0] = []byte("")
-	} else if PGPROXY_PARAMETER_HOOK_POSITION == "last" {
-		if !valid(msg.Parameters[len(msg.Parameters)-1]) {
-			return
-		}
-		msg.Parameters[len(msg.Parameters)-1] = []byte("")
-	}
 }
 
 func key(key, suffix string) string {
