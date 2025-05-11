@@ -97,6 +97,14 @@ func (c *CacheBuffer) CacheFrontend(
 ) bool {
 	switch msg := msg.(type) {
 	case *pgproto3.Query:
+		// We'll ignore `BEGIN` & `ROLLBACK` query since we want to make sure that
+		// any query that the client assumes needs to be atomic to be respected, so we'll
+		// just immediately forward it to the DB
+		if q := strings.ToLower(msg.String); q == "begin" {
+			return true
+		} else if q == "rollback" {
+			return true
+		}
 		return c.cacheFrontendQuery(msg, errChan)
 	case *pgproto3.Bind:
 		return c.cacheFrontendBind(msg, errChan)
