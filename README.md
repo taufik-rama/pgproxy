@@ -1,11 +1,8 @@
 # PostgreSQL proxy w/ caches
 
-### Note: it's still an experimental tooling that I've developed to be used at my workplace, some kinks are still being straightened out, but the idea is workable
-
 Implementation of "wire-level" caches directly with PostgreSQL protocol, cached with [go-redis](https://github.com/redis/go-redis) (or implement the cache yourself)
 
 This can be used as an "in-process" Go library, or as a separate running proxy binary
-
 
 "in process" proxy
 ```
@@ -24,6 +21,10 @@ Separate binary proxy
 | Main logic  | <---- |           | <---- |            |
 |-------------|       |-----------|       |------------|
 ```
+
+### Note: it's still an experimental tooling that I've developed to be used at my workplace
+
+Some kinks are still being straightened out, but for read-only queries it seems to work just fine. The idea is workable
 
 ## Reasoning
 
@@ -50,8 +51,6 @@ go build ./cmd/pgproxy/... && pgproxy
 # Enable the transparent caching
 PGPROXY_ENABLE_CACHE=true go build ./cmd/pgproxy/... && pgproxy
 ```
-
-### TODO: lists out configurations
 
 ### In-memory proxy (pgx)
 
@@ -252,4 +251,21 @@ WHERE
 
 By default the hook checks for the first parameter
 
-### TODO: explain all of the available hook options here
+### Hooks example: cache key format
+
+```golang
+db, err := sql.Open("postgres", "...")
+if err != nil {
+    panic(err)
+}
+stmt, err := db.Prepare("...")
+if err != nil {
+    panic(err)
+}
+// Sets `CACHE_KEY:USER:1` as the cache key prefix, cache would be somewhat like `PGPROXY:CACHE_KEY:USER:1:XXXXX`
+rows, err := stmt.QueryContext(ctx, "PGPROXY,CACHE_KEY:USER:1,...", ... /* normal query parameters */)
+if err != nil {
+    panic(err)
+}
+// ...
+```
