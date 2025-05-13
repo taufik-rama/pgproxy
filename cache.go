@@ -105,7 +105,35 @@ func (c *CacheBuffer) CacheFrontend(
 		} else if q == "rollback" {
 			return true
 		}
-		return c.cacheFrontendQuery(msg, errChan)
+		// `Query` command doesn't have `Sync` as the savepoint, so we'll just process the cache here
+		if c.cacheFrontendQuery(msg, errChan) {
+			return true
+		}
+		c.Mutex.Lock()
+		key, buf := key(c.key, c.hook.keySuffix), c.frontend
+		c.resetf(true)
+		c.Mutex.Unlock()
+		if !sendCache(
+			addr,
+			backend,
+			nil,                  // `Query` doesn't need `BindComplete`
+			&pgproto3.Describe{}, // `Query` also returns `RowDescription`, so we'll just do empty `Describe` here to trigger it
+			buf.cached.rowDescription,
+			buf.cached.dataRow,
+			buf.cached.commandComplete,
+			buf.cached.readyForQuery,
+			errChan,
+		) {
+			// Cache data issue, we'll release the buffered messages to the backend & let the query run as normal
+			slog.Info("pgproxy_cache_hit_but_invalid", "key", key)
+			frontend.Send(buf.query)
+			if err := frontend.Flush(); err != nil {
+				terminate(errChan, errors.Join(errors.New("error when sending message to backend (`Query` command invalid cache)"), err))
+				return false
+			}
+			return true
+		}
+		return false
 	case *pgproto3.Bind:
 		return c.cacheFrontendBind(msg, errChan)
 	case *pgproto3.Describe:
@@ -145,6 +173,7 @@ func (c *CacheBuffer) CacheFrontend(
 		if !sendCache(
 			addr,
 			backend,
+			buf.bind,
 			buf.describe,
 			buf.cached.rowDescription,
 			buf.cached.dataRow,
@@ -524,6 +553,7 @@ func hash(b []byte) string {
 func sendCache(
 	addr string,
 	backend *pgproto3.Backend,
+	bind *pgproto3.Bind,
 	describe *pgproto3.Describe,
 	rowDescription *pgproto3.RowDescription,
 	datarows []*pgproto3.DataRow,
@@ -531,13 +561,15 @@ func sendCache(
 	ready *pgproto3.ReadyForQuery,
 	errChan chan<- error,
 ) bool {
-	backend.Send(&pgproto3.BindComplete{})
-	if err := backend.Flush(); err != nil {
-		terminate(errChan, errors.Join(errors.New("error when sending message to frontend (BindComplete cached)"), err))
-	}
-	if slog.Default().Handler().Enabled(context.Background(), slog.LevelDebug) {
-		b, _ := json.Marshal(&pgproto3.BindComplete{})
-		slog.Debug("B", "addr", addr, "data", b, "cached", true)
+	if bind != nil {
+		backend.Send(&pgproto3.BindComplete{})
+		if err := backend.Flush(); err != nil {
+			terminate(errChan, errors.Join(errors.New("error when sending message to frontend (BindComplete cached)"), err))
+		}
+		if slog.Default().Handler().Enabled(context.Background(), slog.LevelDebug) {
+			b, _ := json.Marshal(&pgproto3.BindComplete{})
+			slog.Debug("B", "addr", addr, "data", b, "cached", true)
+		}
 	}
 	if describe != nil {
 		// The incoming request contains `Describe` request, but the cache doesn't have
