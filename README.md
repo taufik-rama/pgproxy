@@ -42,6 +42,8 @@ It _seems_ then that based on that workflow, that I can just "piggyback" off of 
 
 ## Example
 
+### Standalone
+
 ```shell
 # By default this is just a proxy
 go build ./cmd/pgproxy/... && pgproxy
@@ -49,7 +51,7 @@ go build ./cmd/pgproxy/... && pgproxy
 
 ```shell
 # Enable the transparent caching
-PGPROXY_ENABLE_CACHE=true go build ./cmd/pgproxy/... && pgproxy
+go build ./cmd/pgproxy/... && PGPROXY_ENABLE_CACHE=true pgproxy
 ```
 
 ### In-memory proxy (pgx)
