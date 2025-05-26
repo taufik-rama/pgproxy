@@ -97,12 +97,10 @@ func (c *CacheBuffer) CacheFrontend(
 ) bool {
 	switch msg := msg.(type) {
 	case *pgproto3.Query:
-		// We'll ignore `BEGIN` & `ROLLBACK` query since we want to make sure that
+		// We'll ignore `BEGIN`, `COMMIT` & `ROLLBACK` query since we want to make sure that
 		// any query that the client assumes needs to be atomic to be respected, so we'll
 		// just immediately forward it to the DB
-		if q := strings.ToLower(msg.String); q == "begin" {
-			return true
-		} else if q == "rollback" {
+		if q := strings.ToLower(msg.String); strings.HasPrefix(q, "begin") || strings.HasPrefix(q, "commit") || strings.HasPrefix(q, "rollback") {
 			return true
 		}
 		// `Query` command doesn't have `Sync` as the savepoint, so we'll just process the cache here
@@ -787,7 +785,7 @@ func (c *CacheRedis) DelPattern(key string) {
 }
 
 type CacheMemory struct {
-	*sync.Mutex
+	*sync.RWMutex
 	data map[string]struct {
 		ttl time.Time
 		val Cache
@@ -795,7 +793,7 @@ type CacheMemory struct {
 }
 
 func NewCacheMemory() *CacheMemory {
-	mem := &CacheMemory{Mutex: new(sync.Mutex), data: map[string]struct {
+	mem := &CacheMemory{RWMutex: new(sync.RWMutex), data: map[string]struct {
 		ttl time.Time
 		val Cache
 	}{}}
@@ -804,8 +802,8 @@ func NewCacheMemory() *CacheMemory {
 }
 
 func (c *CacheMemory) Get(key string) (*Cache, bool) {
-	c.Mutex.Lock()
-	defer c.Mutex.Unlock()
+	c.RWMutex.RLock()
+	defer c.RWMutex.RUnlock()
 	val, ok := c.data[key]
 	if !ok {
 		return nil, false
@@ -818,6 +816,8 @@ func (c *CacheMemory) Set(key string, val Cache) error {
 		jitter = int64(rand.Intn(max(int(jitter), 1)))
 		return time.Duration(ttl+jitter) * time.Second
 	}
+	c.RWMutex.Lock()
+	defer c.RWMutex.Unlock()
 	c.data[key] = struct {
 		ttl time.Time
 		val Cache
@@ -829,8 +829,8 @@ func (c *CacheMemory) Set(key string, val Cache) error {
 }
 
 func (c *CacheMemory) DelPattern(key string) {
-	c.Mutex.Lock()
-	defer c.Mutex.Unlock()
+	c.RWMutex.Lock()
+	defer c.RWMutex.Unlock()
 	for k := range c.data {
 		if strings.Contains(k, key) {
 			delete(c.data, k)
@@ -839,8 +839,9 @@ func (c *CacheMemory) DelPattern(key string) {
 }
 
 func (c *CacheMemory) gc() {
-	c.Mutex.Lock()
-	defer c.Mutex.Unlock()
+	time.Sleep(5 * time.Second)
+	c.RWMutex.Lock()
+	defer c.RWMutex.Unlock()
 	now := time.Now()
 	for k, v := range c.data {
 		if v.ttl.Before(now) {
