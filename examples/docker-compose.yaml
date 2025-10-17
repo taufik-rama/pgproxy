@@ -1,0 +1,44 @@
+services:
+  pgx-basic:
+    build:
+      context: ../
+      dockerfile: examples/pgx-basic/Dockerfile
+      tags:
+        - "local/pgx-basic:latest"
+    command:
+      - /go/bin/pgx-basic
+    depends_on:
+      - simple-database
+      - cache
+  simple-database:
+    image: postgres:15.6
+    configs:
+      - source: postgres-configs
+        target: /docker-entrypoint-initdb.d/init.sql
+    environment:
+      - POSTGRES_USER=pgproxy
+      - POSTGRES_PASSWORD=password
+  cache:
+    image: redis:7.0.11
+    command:
+      - redis-server
+      - /usr/local/etc/redis/redis.conf
+    configs:
+      - source: redis-configs
+        target: /usr/local/etc/redis/redis.conf
+configs:
+  postgres-configs:
+    content: |
+      CREATE TABLE IF NOT EXISTS users (
+        id SERIAL PRIMARY KEY,
+        name VARCHAR(50),
+        email VARCHAR(100) UNIQUE
+      );
+      INSERT INTO users (name, email) VALUES
+        ('Alpha', 'alpha@example.com'),
+        ('Beta', 'beta@example.com'),
+        ('Gamma', 'gamma@example.com')
+      ON CONFLICT (email) DO NOTHING;
+  redis-configs:
+    content: |
+      user pgproxy ON >"password" ~* &* +@all -@dangerous

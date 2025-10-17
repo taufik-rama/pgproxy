@@ -271,3 +271,10 @@ if err != nil {
 }
 // ...
 ```
+
+## Other works
+
+### Pgpool2
+
+I seem to encounter error of something like `failed to open "/var/log/pgpool/oiddir/17069/17508". reason:"No such file or directory"`, which I don't
+know why it was happening, it causes the stale data on cache to not get deleted, which causes issues
